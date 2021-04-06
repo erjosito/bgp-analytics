@@ -17,9 +17,9 @@ Hence, the approach I follow here is getting all routes from the Azure Route Ser
 
 As NVA I will use a Linux appliance with the [BIRD](https://bird.network.cz/) BGP software. BIRD supports logging received BGP messages with the Multi-Threaded Routing Toolkit (MRT) format, documented in [RFC 6396](https://tools.ietf.org/html/rfc6396). BIRD will log all received messages into a file, that can be interpreted with tooling such as the [mrtparse Python module](https://github.com/t2mune/mrtparse).
 
-After decoding the messages, they can be sent to Azure Monitor using the [HTTP Data Collection API](https://docs.microsoft.com/azure/azure-monitor/logs/data-collector-api) (in public preview at the time of this writing). The script reading the MRT messages and sending them to Azure Monitor can be run per intervals, and will get the required credentials with a user managed identity, so that no secret needs to be coded anywhere. The script I used can be found in this repository [here](./mrt2azmon.py).
+After decoding the messages, they can be sent to Azure Monitor using the [HTTP Data Collection API](https://docs.microsoft.com/azure/azure-monitor/logs/data-collector-api) (in public preview at the time of this writing). The script reading the MRT messages and sending them to Azure Monitor can be run in one minute intervals with crontab. The script I used can be found in this repository [here](./mrt2azmon.py).
 
-The script does some formatting before sending the messages to Azure Monitor, such as flattening the JSON structure, but the details are not critical.
+The script does some formatting before sending the messages to Azure Monitor, such as flattening the JSON structure. Besides, it will get the required credentials with a user managed identity, so that no secret needs to be coded anywhere.
 
 After the logs arrive to Azure Monitor, they can be analyzed with Kusto queries, to achieve our initial objectives. The workbook containing the charts in this document can be obtained from this repository [here](./workbook.json).
 
@@ -32,6 +32,8 @@ For example, the first bump in the chart below (at around 8:50pm) corresponds to
 ![Message Summary](./media/message_summary.png)
 
 The second set of queries give an idea of the amount of prefixes and AS paths existing in the network. This is important, for example to identify unwanted routes coming from unexpected AS paths. One use case where this could be relevant is when a BGP misconfiguration on premises sends prefixes learnt over the ExpressRoute Microsoft peering towards the private peering. This kind of visuals would help to identify that problem very quickly.
+
+In the example below I only have 4 routes in the system, but in a production scenario you can have hundreds of them.
 
 ![Prefix Summary](./media/prefix_summary.png)
 
