@@ -1,0 +1,148 @@
+{
+    "version": "Notebook/1.0",
+    "items": [
+      {
+        "type": 1,
+        "content": {
+          "json": "## BGP Analytics\n---\n\nThis workbook analyzes data exported from the BGP adjacencies to the Azure Route Server from a Linux NVA running the BIRD BGP software."
+        },
+        "name": "text - 2"
+      },
+      {
+        "type": 12,
+        "content": {
+          "version": "NotebookGroup/1.0",
+          "groupType": "editable",
+          "items": [
+            {
+              "type": 9,
+              "content": {
+                "version": "KqlParameterItem/1.0",
+                "parameters": [
+                  {
+                    "id": "6f9e1054-4734-4f81-8736-7bb8fafef114",
+                    "version": "KqlParameterItem/1.0",
+                    "name": "TimeRange",
+                    "type": 4,
+                    "isRequired": true,
+                    "value": {
+                      "durationMs": 14400000
+                    },
+                    "typeSettings": {
+                      "selectableValues": [
+                        {
+                          "durationMs": 300000
+                        },
+                        {
+                          "durationMs": 900000
+                        },
+                        {
+                          "durationMs": 1800000
+                        },
+                        {
+                          "durationMs": 3600000
+                        },
+                        {
+                          "durationMs": 14400000
+                        },
+                        {
+                          "durationMs": 43200000
+                        },
+                        {
+                          "durationMs": 86400000
+                        },
+                        {
+                          "durationMs": 604800000
+                        },
+                        {
+                          "durationMs": 2592000000
+                        }
+                      ]
+                    },
+                    "timeContext": {
+                      "durationMs": 86400000
+                    }
+                  }
+                ],
+                "style": "pills",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces"
+              },
+              "name": "parameters - 1"
+            },
+            {
+              "type": 3,
+              "content": {
+                "version": "KqlItem/1.0",
+                "query": "BgpAnalytics_CL\r\n| where TimeGenerated {TimeRange}\r\n| extend MessageType = iif(isnotempty(bgp_message_type_s), bgp_message_type_s, subtype_s)\r\n| summarize count() by MessageType, bin(TimeGenerated, 5m)\r\n| render areachart ",
+                "size": 0,
+                "title": "Log activity",
+                "timeContext": {
+                  "durationMs": 0
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces"
+              },
+              "name": "Log activity"
+            },
+            {
+              "type": 3,
+              "content": {
+                "version": "KqlItem/1.0",
+                "query": "let withdrawn = BgpAnalytics_CL\r\n| where TimeGenerated {TimeRange}\r\n| where isnotempty(bgp_message_withdrawn_routes_0_prefix_s) \r\n| project TimeWithdrawn=TimeGenerated, Prefix = strcat(bgp_message_withdrawn_routes_0_prefix_s, \"/\", \r\ntoint(bgp_message_withdrawn_routes_0_prefix_length_d))\r\n| summarize arg_max(TimeWithdrawn, Prefix) by Prefix;\r\nlet prefixes = BgpAnalytics_CL\r\n| where TimeGenerated {TimeRange}\r\n| where isnotempty(bgp_message_nlri_0_prefix_s)\r\n| extend Prefix=strcat(bgp_message_nlri_0_prefix_s, \"/\", toint(bgp_message_nlri_0_prefix_length_d))\r\n| extend ASpath = bgp_message_path_attributes_1_value_0_value_s, MessageType=bgp_message_type_s\r\n| summarize arg_max(TimeGenerated, Prefix, ASpath) by Prefix\r\n;\r\nprefixes\r\n| join kind=leftouter (withdrawn) on Prefix\r\n| project-away Prefix1, Prefix2, Prefix11\r\n| project-rename LastUpdateTime = TimeGenerated\r\n| where isempty(TimeWithdrawn) or LastUpdateTime > TimeWithdrawn\r\n| summarize count() by ASpath\r\n| render piechart",
+                "size": 0,
+                "title": "Prefixes per AS path",
+                "timeContext": {
+                  "durationMs": 0
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces"
+              },
+              "customWidth": "50",
+              "name": "prefix_no_query"
+            },
+            {
+              "type": 3,
+              "content": {
+                "version": "KqlItem/1.0",
+                "query": "let withdrawn = BgpAnalytics_CL\r\n| where TimeGenerated {TimeRange}\r\n| where isnotempty(bgp_message_withdrawn_routes_0_prefix_s) \r\n| project TimeWithdrawn=TimeGenerated, Prefix = strcat(bgp_message_withdrawn_routes_0_prefix_s, \"/\", \r\ntoint(bgp_message_withdrawn_routes_0_prefix_length_d))\r\n| summarize arg_max(TimeWithdrawn, Prefix) by Prefix;\r\nlet prefixes = BgpAnalytics_CL\r\n| where TimeGenerated {TimeRange}\r\n| where isnotempty(bgp_message_nlri_0_prefix_s)\r\n| extend Prefix=strcat(bgp_message_nlri_0_prefix_s, \"/\", toint(bgp_message_nlri_0_prefix_length_d))\r\n| extend ASpath = bgp_message_path_attributes_1_value_0_value_s, MessageType=bgp_message_type_s\r\n| summarize arg_max(TimeGenerated, Prefix, ASpath) by Prefix\r\n;\r\nprefixes\r\n| join kind=leftouter (withdrawn) on Prefix\r\n| project-away Prefix1, Prefix2, Prefix11\r\n| project-rename LastUpdateTime = TimeGenerated\r\n\r\n",
+                "size": 0,
+                "title": "Prefixes",
+                "timeContext": {
+                  "durationMs": 0
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces"
+              },
+              "customWidth": "50",
+              "name": "query - 2"
+            },
+            {
+              "type": 3,
+              "content": {
+                "version": "KqlItem/1.0",
+                "query": "let prefixes = BgpAnalytics_CL\r\n| where TimeGenerated {TimeRange}\r\n| where isnotempty(bgp_message_nlri_0_prefix_s)\r\n| extend Prefix=strcat(bgp_message_nlri_0_prefix_s, \"/\", toint(bgp_message_nlri_0_prefix_length_d))\r\n| extend ASpath = bgp_message_path_attributes_1_value_0_value_s, MessageType=bgp_message_type_s\r\n| summarize arg_max(TimeGenerated, Prefix, ASpath) by Prefix\r\n| extend dummy=1;\r\nprefixes\r\n| join kind=inner (prefixes) on dummy\r\n| where Prefix1 != Prefix2\r\n| extend Prefix1_split=split(Prefix1,'/'), Prefix2_split=split(Prefix2,'/')\r\n| extend Prefix1_octets=split(Prefix1_split[0], '.'), Prefix2_octets=split(Prefix2_split[0], '.')\r\n| extend Prefix1_int=Prefix1_octets[0]*16777216+Prefix1_octets[1]*65536+Prefix1_octets[2]*256+Prefix1_octets[3]\r\n| extend Prefix2_int=Prefix2_octets[0]*16777216+Prefix2_octets[1]*65536+Prefix2_octets[2]*256+Prefix2_octets[3]\r\n| extend PrefixesXOR=binary_xor(Prefix1_int, Prefix2_int)\r\n| extend Shortest_mask = min_of(toint(Prefix1_split[1]), toint(Prefix2_split[1]))\r\n| extend Shortest_mask_int = tolong((exp2(Shortest_mask) - 1) * exp2(32-Shortest_mask))\r\n| extend Prefix_Overlap_And = binary_and(PrefixesXOR, Shortest_mask_int)\r\n| where Prefix_Overlap_And == 0\r\n| project Prefix, ASpath, Prefix2, ASpath2=ASpath1\r\n\r\n",
+                "size": 0,
+                "title": "Overlapping Prefixes",
+                "timeContext": {
+                  "durationMs": 86400000
+                },
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces"
+              },
+              "customWidth": "50",
+              "name": "query - 4"
+            }
+          ]
+        },
+        "name": "mainGroup"
+      }
+    ],
+    "fallbackResourceIds": [
+      "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/nvalab/providers/Microsoft.OperationalInsights/workspaces/log24664"
+    ],
+    "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

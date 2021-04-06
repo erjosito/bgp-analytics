@@ -1,0 +1,412 @@
+############################################################################
+# Created by Jose Moreno
+# March 2020
+#
+# The script creates a vnet with an NVA cluster behind a LB, plus a VM
+#  with UDRs to send traffic through it.
+#
+############################################################################
+
+# Initialization
+rg=nvalab
+location=eastus
+vnet_name=vnet
+vnet_prefix=192.168.0.0/16
+# VM
+vm_name=testvm
+vm_subnet_name=vm
+vm_subnet_prefix=192.168.2.0/24
+vm_nsg_name=vm-nsg
+vm_sku=Standard_B1s
+vm_pip_name=vm_pip
+# NVA
+nva_subnet_name=nva
+nva_subnet_prefix=192.168.50.0/24
+nva_name=nva01
+nva_nsg_name=nva-nsg
+nva_sku=Standard_B1s
+nva_pip_name=nva_pip
+nva_lb_sku=Standard
+nva_lb_ext_name=nva-lb-ext
+nva_lb_ext_pip=nva-lb-pip
+nva_lb_ext_frontend_name=frontend
+nva_outbound_backend_name=backend-outbound
+nva_outbound_pip_name=nva-outbound
+nva_outbound_frontend_name=frontend-outbound
+nva_outbound_allocated_ports=10000
+nva_outbound_rule_name=outbound
+nva_lb_ext_backend_name=backend-lb
+nva_lb_int_name=nva-lb-int
+nva_lb_int_frontend_ip=192.168.50.100
+nva_lb_int_frontend_name=frontend
+nva_lb_int_backend_name=backend-lb
+nva_inbound_rule_name=inbound
+lb_probe_name=SSHprobe
+lb_probe_port=22
+# RS
+rs_subnet_name=RouteServerSubnet
+rs_subnet_prefix=192.168.0.0/24
+rs_name=rs
+# VNGs
+gw_subnet_name=GatewaySubnet
+gw_subnet_prefix=192.168.100.0/24
+ergw_name=ergw
+
+# Auxiliary function to get the first IP of a subnet (default gateway)
+function first_ip(){
+    subnet=$1
+    IP=$(echo $subnet | cut -d/ -f 1)
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+# Create RG
+az group create -n $rg -l $location
+
+# Create vnet, subnets, PIPs
+az network vnet create -g $rg -n $vnet_name --address-prefix $vnet_prefix
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $nva_subnet_name --address-prefixes $nva_subnet_prefix
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $vm_subnet_name --address-prefixes $vm_subnet_prefix
+az network public-ip create -n $vm_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network public-ip create -n $nva_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network public-ip create -n $nva_outbound_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+vm_pip_ip=$(az network public-ip show -n $vm_pip_name -g $rg --query ipAddress -o tsv)
+nva_pip_ip=$(az network public-ip show -n $nva_pip_name -g $rg --query ipAddress -o tsv)
+nva_outbound_pip_ip=$(az network public-ip show -n $nva_outbound_pip_name -g $rg --query ipAddress -o tsv)
+
+# Create NSGs (2 different ones for VM and NVA for ease of modification)
+az network nsg create -n $vm_nsg_name -g $rg
+az network nsg rule create -n ssh --nsg-name $vm_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n web --nsg-name $vm_nsg_name -g $rg --priority 510 --destination-port-ranges 80 --access Allow --protocol Tcp
+az network nsg create -n $nva_nsg_name -g $rg
+az network nsg rule create -n ssh --nsg-name $nva_nsg_name -g $rg --priority 500 --destination-port-ranges 22 --access Allow --protocol Tcp
+az network nsg rule create -n web --nsg-name $nva_nsg_name -g $rg --priority 510 --destination-port-ranges 80 --access Allow --protocol Tcp
+
+# Create VM
+vm_cloudinit_filename=/tmp/vm_cloudinit.txt
+cat <<EOF > $vm_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt-get update
+  - apt-get install -y apache2
+EOF
+az vm create -n $vm_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $vm_sku --custom-data $vm_cloudinit_filename \
+   --vnet-name $vnet_name --subnet $vm_subnet_name --nsg $vm_nsg_name --public-ip-address "" --no-wait
+
+# Create NVA
+nva_cloudinit_filename=/tmp/nva_cloudinit.txt
+cat <<EOF > $nva_cloudinit_filename
+#cloud-config
+runcmd:
+  - apt update
+  - UCF_FORCE_CONFOLD=1 DEBIAN_FRONTEND=noninteractive apt install -y bird strongswan --fix-missing
+  - sysctl -w net.ipv4.ip_forward=1
+  - sysctl -w net.ipv6.conf.all.forwarding=1
+  - sysctl -w net.ipv4.conf.all.accept_redirects = 0 
+  - sysctl -w net.ipv4.conf.all.send_redirects = 0
+  - iptables -A FORWARD -j ACCEPT
+  - iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+EOF
+az vm create -n $nva_name -g $rg --image UbuntuLTS --generate-ssh-keys --size $nva_sku --custom-data $nva_cloudinit_filename \
+   --vnet-name $vnet_name --subnet $nva_subnet_name --nsg $nva_nsg_name --public-ip-address "" --no-wait
+
+# Create couple of ALBs for NVA: public and private
+# Public ALB (with lb, inbound and outbound rules)
+az network lb create -g $rg -n $nva_lb_ext_name --sku $nva_lb_sku --vnet-name $vnet_name \
+   --frontend-ip-name $nva_lb_ext_frontend_name --public-ip-address $nva_lb_ext_pip --backend-pool-name $nva_lb_ext_backend_name
+az network lb probe create -g $rg --lb-name $nva_lb_ext_name -n $lb_probe_name --protocol tcp --port $lb_probe_port
+az network lb rule create -n HTTP -g $rg --lb-name $nva_lb_ext_name --protocol Tcp --frontend-port 80 --backend-port 80 \
+   --frontend-ip-name $nva_lb_ext_frontend_name --backend-pool-name $nva_lb_ext_backend_name --probe-name $lb_probe_name \
+   --disable-outbound-snat  # Since we are going to create an outbound rule
+nva_lb_ext_backend_id=$(az network lb address-pool show -n $nva_lb_ext_backend_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb inbound-nat-rule create -n $nva_inbound_rule_name --lb-name $nva_lb_ext_name -g $rg \
+   --frontend-ip-name $nva_lb_ext_frontend_name \
+   --protocol Tcp --frontend-port 1022 --backend-port 22
+nva_inbound_rule_id=$(az network lb inbound-nat-rule show -n $nva_inbound_rule_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb frontend-ip create -n $nva_outbound_frontend_name --lb-name $nva_lb_ext_name -g $rg --public-ip-address $nva_outbound_pip_name
+az network lb address-pool create -n $nva_outbound_backend_name --lb-name $nva_lb_ext_name -g $rg  # It is best practice to add a dedicated backend pool for outbound
+nva_outbound_backend_id=$(az network lb address-pool show -n $nva_outbound_backend_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb outbound-rule create -n $nva_outbound_rule_name --lb-name $nva_lb_ext_name -g $rg \
+   --address-pool $nva_outbound_backend_name --frontend-ip-configs $nva_outbound_frontend_name --protocol All --outbound-ports $nva_outbound_allocated_ports
+# Internal ALB (only lb rule)
+az network lb create -g $rg -n $nva_lb_int_name --sku $nva_lb_sku --vnet-name $vnet_name --subnet $nva_subnet_name \
+   --frontend-ip-name $nva_lb_int_frontend_name --private-ip-address-version IPv4 --private-ip-address $nva_lb_int_frontend_ip \
+   --backend-pool-name $nva_lb_int_backend_name
+az network lb probe create -g $rg --lb-name $nva_lb_int_name -n $lb_probe_name --protocol tcp --port $lb_probe_port
+az network lb rule create -n AllPorts -g $rg --lb-name $nva_lb_int_name --protocol All --frontend-port 0 --backend-port 0 \
+   --frontend-ip-name $nva_lb_int_frontend_name --backend-pool-name $nva_lb_int_backend_name --probe-name $lb_probe_name
+nva_lb_int_backend_id=$(az network lb address-pool show -n $nva_lb_int_backend_name --lb-name $nva_lb_int_name -g $rg --query id -o tsv)
+
+# Associate NVA NIC to LBs and configure IP forwarding at Azure level
+nva_nic_id=$(az vm show -n $nva_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+nva_nic_name=$(echo $nva_nic_id | cut -d/ -f 9)
+az network nic update -n $nva_nic_name -g $rg --ip-forwarding true
+nva_ipconfig_name=$(az network nic ip-config list --nic-name $nva_nic_name -g $rg --query '[0].name' -o tsv)
+az network nic ip-config update -n $nva_ipconfig_name --nic-name $nva_nic_name -g $rg --public-ip-address "" # Remove PIP if there was one
+az network nic ip-config update -n $nva_ipconfig_name --nic-name $nva_nic_name -g $rg \
+   --lb-address-pools $nva_lb_ext_backend_id $nva_lb_int_backend_id $nva_outbound_backend_id \
+   --lb-inbound-nat-rules $nva_inbound_rule_id
+
+# Default IP route for the VM subnet 
+az network route-table create -n vm -g $rg
+az network route-table route create -n default --route-table vm -g $rg \
+   --address-prefix '0.0.0.0/0' --next-hop-type VirtualAppliance --next-hop-ip-address $nva_lb_int_frontend_ip
+az network vnet subnet update -n $vm_subnet_name --vnet-name $vnet_name -g $rg --route-table vm
+
+# SSH test into the NVA
+nva_lb_ext_pip_ip=$(az network public-ip show -n $nva_lb_ext_pip -g $rg --query ipAddress -o tsv) && echo $nva_lb_ext_pip_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "ip a"
+
+# SSH test into the VM using the NVA as jump host
+vm_nic_id=$(az vm show -n $vm_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+vm_nic_name=$(echo $vm_nic_id | cut -d/ -f 9)
+vm_private_ip=$(az network nic show -n $vm_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $vm_private_ip
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "ip a"
+
+# Verify outbound traffic from the NVA and the VM
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "curl -s4 ifconfig.co"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -J ${nva_lb_ext_pip_ip}:1022 $vm_private_ip "curl -s4 ifconfig.co"
+echo "Both previous outputs should be the outbound NAT PIP $nva_outbound_pip_ip"
+
+#################
+# Log Analytics #
+#################
+
+# Create Log Analytics workspace
+logws_name=$(az monitor log-analytics workspace list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the WS name if it already existed
+if [[ -z "$logws_name" ]]
+then
+    echo "No Log Analytics workspace found, creating one..."
+    logws_name=log$RANDOM
+    az monitor log-analytics workspace create -n $logws_name -g $rg
+fi
+logws_id=$(az resource list -g $rg -n $logws_name --query '[].id' -o tsv) && echo $logws_id
+logws_customerid=$(az monitor log-analytics workspace show -n $logws_name -g $rg --query customerId -o tsv) && echo $logws_customerid
+logws_key=$(az monitor log-analytics workspace get-shared-keys -n $logws_name -g $rg --query primarySharedKey -o tsv)
+
+# Onboard NVA VM to Log Analytics
+url="https://raw.githubusercontent.com/Microsoft/OMS-Agent-for-Linux/master/installer/scripts/onboard_agent.sh"
+ssh -p 1022 $nva_lb_ext_pip_ip "wget $url && sh onboard_agent.sh -w $logws_customerid -s $logws_key"
+
+# You need to enable custom logs via the portal
+
+# Query NVA logs
+query_syslog='Syslog
+| where TimeGenerated >= ago(1h)
+| take 10'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_syslog -o tsv
+
+#################
+# NSG Flow Logs #
+#################
+
+# Create Storage Account
+storage_account_name=$(az storage account list -g $rg --query '[].name' -o tsv 2>/dev/null)  # Retrieve the storage account name if it already existed
+if [[ -z "$storage_account_name" ]]
+then
+    echo "No Storage Account found, creating one..."
+    storage_account_name=storage$RANDOM
+    az storage account create -n $storage_account_name -g $rg --sku Standard_LRS --kind StorageV2
+fi
+storage_account_key=$(az storage account keys list -n $storage_account_name -g $rg --query '[0].value' -o tsv)
+
+# Enable flow logs for both NSGs (VM and NVA)
+az network watcher flow-log create -l $location -n "flowlog-vm-$location" -g $rg \
+    --nsg $vm_nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
+    --workspace $logws_id --interval 10 --traffic-analytics true
+az network watcher flow-log create -l $location -n "flowlog-nva-$location" -g $rg \
+    --nsg $nva_nsg_name --storage-account $storage_account_name --log-version 2 --retention 7 \
+    --workspace $logws_id --interval 10 --traffic-analytics true
+
+# Query NSG Flow Logs
+query_flowlog='AzureNetworkAnalytics_CL
+| where TimeGenerated >= ago(1h)
+| where SubType_s == "FlowLog"
+//| where DeniedInFlows_d > 0 or DeniedOutFlows_d > 0
+//| where SrcIP_s == "1.2.3.4"
+| project NSGName=split(NSGList_s, "/")[2],NSGRules_s,DeniedInFlows_d,DeniedOutFlows_d,SrcIP_s,DestIP_s,DestPort_d,L7Protocol_s
+| take 20'
+az monitor log-analytics query -w $logws_customerid --analytics-query $query_flowlog -o tsv
+
+####################
+#   Route Server   #
+####################
+
+# Create Route Server
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n $rs_subnet_name --address-prefixes $rs_subnet_prefix
+rs_subnet_id=$(az network vnet subnet show -n $rs_subnet_name --vnet-name $vnet_name -g $rg --query id -o tsv)
+az network routeserver create -n $rs_name -g $rg --hosted-subnet $rs_subnet_id -l $location
+rs_asn=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterAsn' -o tsv) && echo $rs_asn
+rs_ip1=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[0]' -o tsv) && echo $rs_ip1
+rs_ip2=$(az network routeserver show -n $rs_name -g $rg --query 'virtualRouterIps[1]' -o tsv) && echo $rs_ip2
+
+# Get NVA's private IP
+nva_nic_id=$(az vm show -n $nva_name -g $rg --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+nva_nic_name=$(echo $nva_nic_id | cut -d/ -f 9)
+nva_private_ip=$(az network nic show -n $nva_nic_name -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv) && echo $nva_private_ip
+
+# Configure BGP on NVA
+nva_asn=65001
+nva_default_gw=$(first_ip "$nva_subnet_prefix") && echo $nva_default_gw
+mrt_file="/tmp/bird-mrtdump_bgp"
+bird_config_file=/tmp/bird.conf
+cat <<EOF > $bird_config_file
+mrtdump protocols all;
+mrtdump "$mrt_file";
+log syslog all;
+router id $nva_private_ip;
+protocol device {
+        scan time 10;
+}
+protocol direct {
+      disabled;
+}
+protocol kernel {
+      disabled;
+}
+protocol static {
+      import all;
+      route $rs_ip1/32 via $nva_default_gw;
+      route $rs_ip2/32 via $nva_default_gw;
+}
+protocol bgp rs0 {
+      description "RouteServer instance 0";
+      multihop;
+      local $nva_private_ip as $nva_asn;
+      neighbor $rs_ip1 as $rs_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+protocol bgp rs1 {
+      description "Route Server instance 1";
+      multihop;
+      local $nva_private_ip as $nva_asn;
+      neighbor $rs_ip2 as $rs_asn;
+          import filter {accept;};
+          export filter {accept;};
+}
+EOF
+username=$(whoami)
+scp -P 1022 $bird_config_file "${nva_lb_ext_pip_ip}:/home/${username}/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo touch $mrt_file"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo chmod 666 $mrt_file"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo mv /home/${username}/bird.conf /etc/bird/bird.conf"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo systemctl restart bird"
+# ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "systemctl status bird"
+a
+# Add RS peering to NVA
+az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $nva_private_ip --peer-asn $nva_asn -n $nva_name
+
+# Create Identity to allow access to keyvault, and assign it to the VM
+akv_name=erjositoKeyvault
+id_name=nvaid
+az identity create -n $id_name -g $rg
+id_principal_id=$(az identity show -n $id_name -g $rg --query principalId -o tsv)
+az keyvault set-policy -n "$akv_name" --object-id "$id_principal_id" --secret-permissions get list 
+id_id=$(az identity show -n $id_name -g $rg --query id -o tsv)
+az vm identity assign -n $nva_name -g $rg --identities $id_name
+
+# Upload configuration details in the form of secrets in the keyvault
+az keyvault secret set -n 'bgp-logws-id' --value $logws_customerid --vault-name $akv_name
+az keyvault secret set -n 'bgp-logws-key' --value $logws_key --vault-name $akv_name
+
+# Install python software to report BGP updates to Azure Log Analytics
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo apt install -y python3-pip"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "sudo pip3 install mrtparse azure-keyvault-secrets azure-identity"
+script_url="https://raw.githubusercontent.com/erjosito/azcli/master/mrt2azmon.py"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "wget $script_url"
+cmd="/usr/bin/python3 /home/${username}/mrt2azmon.py -v erjositoKeyvault"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -p 1022 $nva_lb_ext_pip_ip "(crontab -l 2>/dev/null; echo '* * * * * $cmd') | crontab -"
+
+# Test adding a spoke to the vnet, which should inject a new IP into BGP, and generate some BGP logs
+test_spoke_name=testspoke
+test_spoke_prefix=10.13.76.0/24
+az network vnet create -g $rg -n $test_spoke_name --address-prefix $test_spoke_prefix
+az network vnet peering create -n hub2spoke -g $rg --vnet-name $vnet_name --remote-vnet $test_spoke_name --allow-vnet-access --allow-forwarded-traffic --allow-gateway-transit
+az network vnet peering create -n spoke2hub -g $rg --vnet-name $test_spoke_name --remote-vnet $vnet_name --allow-vnet-access --allow-forwarded-traffic --use-remote-gateway
+# Delete peerings
+sleep 60
+az network vnet peering delete -n hub2spoke -g $rg --vnet-name $vnet_name
+az network vnet peering delete -n spoke2hub -g $rg --vnet-name $test_spoke_name
+
+# Test deleting and readding the RS peerings to simulate a BGP bounce
+az network routeserver peering delete --routeserver $rs_name -g $rg -n $nva_name -y
+az network routeserver peering create --routeserver $rs_name -g $rg --peer-ip $nva_private_ip --peer-asn $nva_asn -n $nva_name
+
+####################
+#   ExpressRoute   #
+####################
+
+# Variables
+er_circuit_name=nvatest
+er_pop="New York"
+er_provider=Megaport
+
+# Create ER GW and circuit
+az network vnet subnet create -n $gw_subnet_name --address-prefix $gw_subnet_prefix --vnet-name $vnet_name -g $rg
+az network public-ip create -g $rg -n "${ergw_name}-pip" --allocation-method Dynamic --sku Basic
+az network vnet-gateway create -g $rg -n $ergw_name --gateway-type ExpressRoute --sku Standard -l $location \
+    --vnet $vnet_name --public-ip-addresses "${ergw_name}-pip" --no-wait
+az network express-route create -n $er_circuit_name --peering-location $er_pop -g $rg \
+    --bandwidth 50 Mbps --provider $er_provider -l $location --sku-family MeteredData --sku-tier Standard
+circuit_id=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query id) && echo $circuit_id
+circuit_key=$(az network express-route show -n $er_circuit_name -g $rg -o tsv --query serviceKey) && echo $circuit_key
+
+# Update RS to exchange routes with the ER Gateway
+az network routeserver update -n $rs_name -g $rg --allow-b2b-traffic
+
+# Once the circuit is Provider-Provisioned and the GW is Successful:
+az network vpn-connection create -n erconnection -g $rg --vnet-gateway1 $ergw_name --express-route-circuit2 $circuit_id
+
+# Diagnostics
+az network vnet-gateway show -g $rg -n $ergw_name -o tsv --query provisioningState
+az network express-route show -n $er_circuit_name -g $rg -o tsv --query serviceProviderProvisioningState
+
+# Optional: Create another VNet with a similar prefix, and attach it to the same ER circuit
+rogue_vnet_name=rogue
+rogue_vnet_prefix=192.168.64.0/22
+rogue_gw_subnet_prefix=192.168.64.0/24
+rogue_ergw_name=rogue-ergw
+az network vnet create -n $rogue_vnet_name -g $rg --address-prefixes $rogue_vnet_prefix --subnet-name GatewaySubnet --subnet-prefixes $rogue_gw_subnet_prefix
+az network public-ip create -g $rg -n "${rogue_ergw_name}-pip" --allocation-method Dynamic --sku Basic
+az network vnet-gateway create -g $rg -n $rogue_ergw_name --gateway-type ExpressRoute --sku Standard -l $location \
+    --vnet $rogue_vnet_name --public-ip-addresses "${rogue_ergw_name}-pip"
+az network vpn-connection create -n rogueerconnection -g $rg --vnet-gateway1 $rogue_ergw_name --express-route-circuit2 $circuit_id
+
+##########################
+#  Other optional tests  #
+##########################
+
+# Test: configure secondary ip in the NVA, and add a specific outbound rule
+# Goal: specific SNAT for certain workloads going through the NVA
+nva_ipconfig_2ary_name=ipconfig2
+nva_outbound_2ary_pip_name=outbound-2ary-pip
+nva_outbound_2ary_backend_name=backend-nat-2ary
+nva_outbound_2ary_frontend_name=frontend-nat-2ary
+nva_outbound_2ary_rule_name=outbound-2ary
+az network nic ip-config create -n $ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --vnet-name $vnet_name --subnet $nva_subnet_name --private-ip-address-version IPv4 --public-ip-address ""
+az network public-ip create -n $nva_outbound_2ary_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network lb frontend-ip create -n $nva_outbound_2ary_frontend_name --lb-name $nva_lb_ext_name -g $rg --public-ip-address $nva_outbound_2ary_pip_name
+az network lb address-pool create -n $nva_outbound_2ary_backend_name --lb-name $nva_lb_ext_name -g $rg
+nva_outbound_2ary_backend_id=$(az network lb address-pool show -n $nva_outbound_2ary_backend_name --lb-name $nva_lb_ext_name -g $rg --query id -o tsv)
+az network lb outbound-rule create -n $nva_outbound_2ary_rule_name --lb-name $nva_lb_ext_name -g $rg \
+   --address-pool $nva_outbound_2ary_backend_name --frontend-ip-configs $nva_outbound_2ary_frontend_name --protocol All --outbound-ports $nva_outbound_allocated_ports
+az network nic ip-config update -n $nva_ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --lb-address-pools $nva_outbound_2ary_backend_id
+# Error:
+# "OutboundRule /blah/outbound-2ary cannot be used with Backend Address Pool /blah/backend-nat-2ary that contains Secondary IPConfig /blah/ipconfig2"
+
+# Test: Assign new public-ip to 2ary config
+test_pip_name=test-pip
+az network public-ip create -n $test_pip_name -g $rg --sku Standard --allocation-method static --version IPv4
+az network nic ip-config update -n $nva_ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --public-ip-address $test_pip_name
+
+# Test: put 2ary ip-configuration on different subnet does not work, as expected
+az network vnet subnet create -g $rg --vnet-name $vnet_name -n test_subnet --address-prefixes 192.168.31.0/24
+az network nic ip-config update -n $nva_ipconfig_2ary_name --nic-name $nva_nic_name -g $rg --vnet-name $vnet_name --subnet test_subnet
+# Error:
+# "IPConfigurations on a Nic /blah/nva01VMNic cannot belong to different subnets. Subnets referred: /blah/nva;/blah/test_subnet"
+
+# Verification commands
+az network public-ip list -g $rg -o table
